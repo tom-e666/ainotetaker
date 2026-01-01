@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"strings"
 
+	"google.golang.org/api/option"
 	"google.golang.org/genai"
 )
 
@@ -78,15 +79,13 @@ func gemini(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := context.Background()
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey: os.Getenv("GEMINI_API_KEY"),
-	})
+	client, err := genai.NewGenerativeClient(ctx, option.WithAPIKey(os.Getenv("GEMINI_API_KEY")))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-1.5-flash")
+	model := client.GenerativeModel("gemini-pro")
 	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
