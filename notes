@@ -1,0 +1,598 @@
+BÁO CÁO KỸ THUẬT: ĐẶC TẢ HỆ THỐNG GHI CHÚ TÍCH HỢP AI (SECOND BRAIN)
+1. Tổng quan Điều hành & Kiến trúc Hệ thống
+Báo cáo này cung cấp một bản đặc tả kỹ thuật toàn diện cho việc phát triển ứng dụng "AI-Enhanced Note Taker", được thiết kế để hoạt động như một "Bộ não thứ hai" (Second Brain) cho người dùng. Tài liệu này đi sâu vào chiến lược triển khai hai phân hệ chính: Backend (Go/Fiber) và Frontend (Next.js), tích hợp khả năng trí tuệ nhân tạo tạo sinh (Generative AI) thông qua Google Gemini.
+
+1.1 Triết lý Kiến trúc: Modular Monolith
+Thay vì áp dụng ngay kiến trúc Microservices vốn đi kèm với độ phức tạp vận hành cao (distributed tracing, độ trễ mạng), hệ thống này được thiết kế theo mô hình Modular Monolith. Đây là sự lựa chọn tối ưu cho các ứng dụng có quy mô từ khởi nghiệp đến trung bình lớn, cho phép đóng gói các miền nghiệp vụ (Domain) riêng biệt (như Auth, Notes, Tasks, AI) vào trong một đơn vị triển khai duy nhất nhưng vẫn giữ ranh giới code nghiêm ngặt.   
+
+Mô hình này giải quyết vấn đề "Big Ball of Mud" thường thấy ở các ứng dụng Monolith truyền thống bằng cách cô lập logic nghiệp vụ. Các module giao tiếp với nhau qua các public interface hoặc in-process event bus, loại bỏ độ trễ mạng nội bộ trong khi vẫn đảm bảo khả năng tách ra thành Microservices trong tương lai nếu nhu cầu mở rộng đòi hỏi.   
+
+1.2 Stack Công nghệ Cốt lõi
+Lớp (Layer)	Công nghệ	Lý do kỹ thuật & Lợi ích
+Backend Core	Go (Golang) 1.22+	
+Hiệu suất cao, quản lý concurrency tốt qua Goroutines, và hệ sinh thái mạnh cho cloud-native.
+
+Web Framework	Fiber v2/v3	
+Xây dựng trên nền fasthttp, Fiber cung cấp hiệu suất xử lý HTTP vượt trội so với net/http chuẩn, tối ưu hóa bộ nhớ.
+
+API Protocol	GraphQL (gqlgen)	
+Giảm thiểu over-fetching dữ liệu, định nghĩa schema rõ ràng giúp đồng bộ giữa FE và BE.
+
+Cơ sở dữ liệu	PostgreSQL 16+	
+Hỗ trợ ACID, JSONB cho dữ liệu linh hoạt, và đặc biệt là extension pgvector cho lưu trữ vector.
+
+AI Engine	Google Gemini 1.5	
+Context Window lớn (1M+ tokens) và tính năng Context Caching giúp tối ưu chi phí RAG.
+
+Frontend	Next.js 14+	
+App Router và React Server Components (RSC) tối ưu SEO và tải trang ban đầu.
+
+UI Library	Shadcn UI + ReactBits	
+Shadcn cho các component chức năng (accessible), ReactBits cho các hiệu ứng tương tác cao.
+
+  
+TẬP I: ĐẶC TẢ KỸ THUẬT BACKEND (SERVER-SIDE ENGINEERING)
+Phân hệ Backend chịu trách nhiệm quản lý vòng đời dữ liệu, thực thi logic nghiệp vụ, bảo mật, và điều phối các quy trình xử lý ngôn ngữ tự nhiên (NLP).
+
+2. Cấu trúc Dự án & Tổ chức Code (Go Modular Monolith)
+Để đảm bảo tính module hóa, cấu trúc thư mục không được phẳng (flat) mà phải phân chia rõ ràng giữa các tầng Infrastructure, Interface, và Domain. Cấu trúc này tuân thủ nguyên lý Clean Architecture, đảm bảo các module nghiệp vụ không bị phụ thuộc chặt chẽ vào các thư viện bên ngoài.   
+
+2.1 Cây thư mục chi tiết
+Plaintext
+/cmd
+  /api                  # Entry point chính (main.go), khởi tạo Fiber app
+/internal
+  /common               # Các tiện ích chia sẻ (Logger, Custom Errors, Validators)
+  /config               # Load biến môi trường, Flags [2]
+  /infrastructure       # Triển khai các driver kết nối (Postgres, Redis, Gemini Client)
+  /middleware           # Fiber Middlewares (Auth, CORS, Logger, ContextAdaptor)
+  /modules              # Cốt lõi của Modular Monolith
+    /auth               # Module: Xác thực & Quản lý User
+      /delivery         # HTTP Handlers / GraphQL Resolvers
+      /service          # Business Logic (Use Cases)
+      /repository       # Data Access Layer (Postgres/Pgx)
+      /models           # Domain Entities
+    /notes              # Module: Quản lý Ghi chú & Vector Search
+    /tasks              # Module: Quản lý Task & Lịch trình
+    /ai                 # Module: RAG Pipeline & Gemini Wrapper
+/pkg                    # Các thư viện public (nếu có)
+/graph                  # GraphQL Schema & Generated Code [10]
+  /generated            # Runtime của gqlgen
+  /model                # Models được generate từ schema
+/migrations             # SQL Migration files (quản lý schema DB)
+go.mod
+Dockerfile
+Quy tắc Kiến trúc:
+
+Dependency Rule: Các modules có thể phụ thuộc vào internal/common hoặc internal/infrastructure, nhưng internal/common tuyệt đối không được phụ thuộc ngược lại vào modules.
+
+Module Isolation: Module Notes không được phép import trực tiếp tasks/repository. Nếu cần dữ liệu chéo, chúng phải giao tiếp thông qua Interface được định nghĩa ở service layer.   
+
+3. Thiết kế Cơ sở dữ liệu (PostgreSQL + pgvector)
+Hệ thống sử dụng PostgreSQL làm kho dữ liệu chính, tận dụng khả năng quan hệ (Relational) cho cấu trúc dữ liệu và pgvector cho khả năng tìm kiếm ngữ nghĩa (Semantic Search).
+
+3.1 Cấu hình Extension
+Việc kích hoạt extension vector là bắt buộc để hỗ trợ RAG. Ngoài ra, uuid-ossp được dùng để sinh khóa chính ngẫu nhiên, tăng tính bảo mật so với ID tự tăng.   
+
+SQL
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "vector";
+3.2 Schema Chi tiết
+Bảng users (Identity Management)
+Lưu trữ thông tin danh tính. Mật khẩu phải được hash bằng Argon2 hoặc Bcrypt trước khi lưu.
+
+SQL
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    full_name VARCHAR(100),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+Bảng notes (Core RAG Data)
+Đây là bảng trung tâm của hệ thống. Ngoài nội dung văn bản, bảng này chứa cột embedding lưu trữ vector 768 chiều (tương thích với model text-embedding-004 của Google). Cột content_search dạng tsvector được thêm vào để hỗ trợ tìm kiếm từ khóa (Full-text Search), tạo tiền đề cho giải pháp "Hybrid Search".   
+
+SQL
+CREATE TABLE notes (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    is_archived BOOLEAN DEFAULT FALSE,
+    is_pinned BOOLEAN DEFAULT FALSE,
+    
+    -- Vector column: 768 chiều cho Gemini Embeddings
+    embedding vector(768), 
+    
+    -- Full-text search column: Tự động cập nhật khi title/content thay đổi
+    content_search tsvector GENERATED ALWAYS AS (to_tsvector('english', title |
+
+| ' ' |
+| content)) STORED,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Index HNSW: Tối ưu cho tốc độ tìm kiếm vector gần đúng (ANN) [23]
+CREATE INDEX ON notes USING hnsw (embedding vector_cosine_ops);
+
+-- Index GIN: Tối ưu cho tìm kiếm từ khóa truyền thống
+CREATE INDEX idx_notes_content_search ON notes USING GIN (content_search);
+Bảng tasks (Recurrence Engine)
+Để hỗ trợ các tác vụ lặp lại (ví dụ: "Họp mỗi thứ Hai"), chúng ta sử dụng chuẩn RRule (Recurrence Rule). Thay vì tạo hàng nghìn bản ghi cho tương lai, hệ thống chỉ lưu quy tắc lặp và cha (parent task).   
+
+SQL
+CREATE TABLE tasks (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    note_id UUID REFERENCES notes(id) ON DELETE SET NULL, 
+    title TEXT NOT NULL,
+    due_date TIMESTAMPTZ,
+    is_completed BOOLEAN DEFAULT FALSE,
+    
+    -- Lưu trữ chuỗi RRule, ví dụ: "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO"
+    recurrence_rule TEXT, 
+    
+    -- Tham chiếu đến task gốc nếu đây là một ngoại lệ của chuỗi lặp
+    parent_task_id UUID REFERENCES tasks(id),
+    
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+4. Thiết kế API & Chiến lược Triển khai
+Backend cung cấp GraphQL API thông qua thư viện gqlgen. Việc sử dụng GraphQL trên nền Fiber đòi hỏi một lớp Adapter đặc biệt vì gqlgen được thiết kế cho net/http chuẩn, trong khi Fiber sử dụng fasthttp để tối ưu hiệu năng.   
+
+4.1 Tích hợp Fiber và Gqlgen (Context Management)
+Một thách thức lớn trong kiến trúc này là việc truyền tải context (chứa thông tin user từ middleware xác thực) vào trong các GraphQL Resolver. Fiber quản lý context riêng (*fiber.Ctx), do đó cần một middleware để chuyển đổi và inject dữ liệu vào context.Context chuẩn của Go.   
+
+Mã nguồn triển khai Adapter:
+
+Go
+// internal/middleware/auth.go
+package middleware
+
+import (
+    "context"
+    "github.com/gofiber/fiber/v2"
+)
+
+type ctxKey string
+const UserCtxKey ctxKey = "user_id"
+
+// Middleware xác thực và inject User ID vào Context
+func AuthMiddleware(c *fiber.Ctx) error {
+    // 1. Logic kiểm tra JWT Token từ Header
+    token := c.Get("Authorization")
+    userId, err := validateToken(token) // Hàm giả định
+    if err!= nil {
+        return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Unauthorized"})
+    }
+
+    // 2. Tạo context mới chứa User ID
+    ctx := context.WithValue(c.Context(), UserCtxKey, userId)
+    
+    // 3. Gán đè context này vào Fiber Context để gqlgen có thể đọc được
+    c.SetUserContext(ctx)
+    
+    return c.Next()
+}
+4.2 Module AI: Quy trình RAG (Retrieval-Augmented Generation)
+Module AI là trái tim của tính năng "Enhanced Note Taker". Quy trình này bao gồm 3 giai đoạn chính: Ingestion, Retrieval (Hybrid), và Generation.
+
+Giai đoạn 1: Ingestion (Tạo Embedding)
+Khi một ghi chú được tạo hoặc cập nhật (CreateNote, UpdateNote), hệ thống sẽ kích hoạt quy trình tạo vector.
+
+Sanitization: Làm sạch văn bản đầu vào (loại bỏ HTML tags thừa).
+
+Embedding Call: Gửi văn bản đến Google Gemini API (models/text-embedding-004).
+
+Storage: Nhận về vector (float32) và lưu vào cột embedding trong PostgreSQL.   
+
+Giai đoạn 2: Hybrid Retrieval (Tìm kiếm Lai)
+Việc chỉ dựa vào tìm kiếm vector thường bỏ sót các từ khóa chính xác (ví dụ: mã dự án, tên riêng). Hệ thống sử dụng thuật toán Reciprocal Rank Fusion (RRF) để kết hợp kết quả từ Semantic Search (Vector) và Keyword Search (TSVector).   
+
+Truy vấn SQL cho Hybrid Search:
+
+SQL
+WITH semantic_search AS (
+    SELECT id, RANK() OVER (ORDER BY embedding <=> $1) AS rank
+    FROM notes
+    WHERE user_id = $2
+    ORDER BY embedding <=> $1
+    LIMIT 20
+),
+keyword_search AS (
+    SELECT id, RANK() OVER (ORDER BY ts_rank_cd(content_search, websearch_to_tsquery('english', $3)) DESC) AS rank
+    FROM notes
+    WHERE user_id = $2 AND content_search @@ websearch_to_tsquery('english', $3)
+    LIMIT 20
+)
+SELECT 
+    COALESCE(s.id, k.id) AS id,
+    -- Công thức RRF: 1 / (k + rank)
+    (COALESCE(1.0 / (60 + s.rank), 0.0) + COALESCE(1.0 / (60 + k.rank), 0.0)) AS rrf_score
+FROM semantic_search s
+FULL OUTER JOIN keyword_search k ON s.id = k.id
+ORDER BY rrf_score DESC
+LIMIT 10;
+$1: Vector của câu truy vấn.
+
+$2: User ID (Boundary bảo mật).
+
+$3: Chuỗi văn bản truy vấn gốc.
+
+Giai đoạn 3: Generation (Context Caching)
+Đối với các yêu cầu phức tạp như "Tóm tắt 50 ghi chú gần nhất về Dự án X", lượng context gửi lên LLM có thể rất lớn. Hệ thống sử dụng tính năng Context Caching của Gemini để giảm độ trễ và chi phí.   
+
+Cơ chế: Nếu nội dung context vượt quá ngưỡng (ví dụ: 10,000 tokens) và được truy cập thường xuyên, backend sẽ gọi API CachedContent.create của Gemini. Các request tiếp theo chỉ cần gửi cache_name thay vì toàn bộ nội dung text, giúp giảm chi phí token đầu vào đáng kể.   
+
+TẬP II: ĐẶC TẢ KỸ THUẬT FRONTEND (CLIENT-SIDE ENGINEERING)
+Frontend đóng vai trò giao diện người dùng, đảm bảo trải nghiệm mượt mà, phản hồi tức thì và trực quan hóa dữ liệu phức tạp.
+
+5. Kiến trúc Frontend (Next.js App Router)
+Ứng dụng sử dụng Next.js 14+ với App Router để tận dụng React Server Components (RSC). Điều này cho phép render phần lớn giao diện trên server, giảm lượng JavaScript gửi xuống client và tối ưu hóa SEO.   
+
+5.1 Cấu trúc Thư mục (Feature-based)
+Plaintext
+/src
+  /app
+    /(auth)               # Route Group: Layout riêng cho Login/Register [31]
+      /login/page.tsx
+      /register/page.tsx
+    /(dashboard)          # Route Group: Layout chính (Sidebar, Navbar)
+      /notes
+        /page.tsx         # Danh sách ghi chú (Server Component)
+        /[id]/page.tsx    # Chi tiết/Editor ghi chú
+      /tasks/page.tsx
+      /search/page.tsx    # Giao diện Chat AI / Hybrid Search
+      /layout.tsx         # Dashboard Shell (Providers, Global State)
+  /components
+    /ui                   # Shadcn UI primitives (Button, Input, Dialog)
+    /features             # Components theo nghiệp vụ
+      /notes              # NoteCard, Editor, MasonryGrid
+      /ai                 # ChatInterface, MessageBubble
+    /shared               # Sidebar, Header, ThemeToggle
+  /lib
+    /api                  # GraphQL Client (Urql hoặc TanStack Query fetcher)
+    /store                # Zustand Stores
+    /utils.ts             # CN helper, formatters
+  /hooks                  # Custom React Hooks (useDebounce, useMasonry)
+6. Thiết kế Giao diện & Trải nghiệm (UI/UX)
+6.1 Hệ thống Component (Shadcn UI + ReactBits)
+Functional UI: Sử dụng Shadcn UI (xây dựng trên Radix UI) cho các thành phần cốt lõi như Dialog, Dropdown, Form. Lợi điểm là khả năng tùy biến cao do code nằm trực tiếp trong dự án (/components/ui) thay vì nằm trong node_modules.   
+
+Creative UI: Tích hợp ReactBits để tạo điểm nhấn thị giác:
+
+Masonry Grid: Sử dụng cho màn hình danh sách ghi chú. Thay vì dùng CSS thuần (không hỗ trợ thứ tự dòng thời gian chuẩn xác), hệ thống sử dụng triển khai JavaScript để tính toán vị trí các card, tạo hiệu ứng xếp gạch như Google Keep.   
+
+Tilted Card: Sử dụng cho các ghi chú được "Ghim" (Pinned) hoặc các Insight quan trọng từ AI, tạo hiệu ứng 3D khi di chuột.   
+
+Animated Backgrounds: Sử dụng các hiệu ứng hạt (particles) hoặc gradient động ở trang Login/Register để tăng tính thẩm mỹ.   
+
+6.2 Chiến lược Triển khai Masonry Grid
+Render một bố cục Masonry trong môi trường SSR (Server-Side Rendering) là một thách thức kỹ thuật vì chiều cao của các item chưa được xác định cho đến khi client render.
+
+Giải pháp: Sử dụng thư viện như masonic hoặc custom hook useMasonry.
+
+SSR Handling: Trên server, render một lưới Skeleton (Loading placeholder) với chiều cao ngẫu nhiên giả lập. Khi Client Hydration hoàn tất, script Masonry sẽ tính toán lại vị trí và sắp xếp các item vào đúng cột.   
+
+TypeScript
+// components/features/notes/MasonryGrid.tsx
+'use client';
+import { Masonry } from "masonic"; 
+import { NoteCard } from "./NoteCard";
+
+export function NoteGrid({ notes }) {
+  return (
+    <Masonry
+      items={notes}
+      columnGutter={16}
+      columnWidth={300}
+      render={NoteCard}
+      // Overscan giúp render trước các item ngoài khung nhìn để cuộn mượt mà
+      overscanBy={5} 
+    />
+  );
+}
+7. Quản lý Trạng thái (State Management)
+Hệ thống áp dụng mô hình quản lý trạng thái lai (Hybrid State Management) để tách biệt dữ liệu server và trạng thái giao diện.   
+
+7.1 Server State: TanStack Query (React Query)
+Dùng để quản lý dữ liệu từ GraphQL API.
+
+Optimistic Updates: Khi người dùng thực hiện hành động như "Lưu trữ ghi chú" (Archive), UI cần phản hồi ngay lập tức trước khi server trả về kết quả. TanStack Query cho phép cập nhật cache cục bộ ngay lập tức và rollback nếu API lỗi.   
+
+Query Keys: Định nghĩa chuẩn hóa, ví dụ: ['notes', { filter: 'archived' }] hoặc ['search', { q: query }].
+
+7.2 Client State: Zustand
+Dùng cho các trạng thái toàn cục của UI không cần lưu xuống DB.
+
+Ví dụ: Trạng thái đóng/mở của Sidebar, dữ liệu tạm thời của Modal đang mở, hoặc Theme hiện tại.
+
+Code mẫu Store:
+
+TypeScript
+import { create } from 'zustand'
+
+interface UIState {
+  isSearchPanelOpen: boolean
+  toggleSearchPanel: () => void
+}
+
+export const useUIStore = create<UIState>((set) => ({
+  isSearchPanelOpen: false,
+  toggleSearchPanel: () => set((state) => ({ isSearchPanelOpen:!state.isSearchPanelOpen })),
+}))
+KẾ HOẠCH TRIỂN KHAI & HẠ TẦNG (DEVOPS)
+Hệ thống được thiết kế để container hóa toàn bộ, sẵn sàng triển khai trên bất kỳ nền tảng Cloud nào (AWS, GCP) hoặc PaaS (Railway, Render).
+
+8. Chiến lược Docker (Multi-Stage Builds)
+Sử dụng Multi-stage builds là bắt buộc để tối ưu hóa kích thước image và bảo mật (loại bỏ mã nguồn và công cụ build khỏi image chạy thực tế).
+
+8.1 Backend Dockerfile (Go Distroless)
+Chúng ta build ứng dụng trong môi trường golang:alpine nhưng chạy ứng dụng trong gcr.io/distroless/static. Image Distroless không chứa shell hay package manager, giảm bề mặt tấn công xuống mức tối thiểu và kích thước image chỉ khoảng 20-30MB.   
+
+Dockerfile
+# Stage 1: Builder
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum./
+RUN go mod download
+COPY..
+# Build binary tĩnh, tắt CGO
+RUN CGO_ENABLED=0 GOOS=linux go build -o main./cmd/api
+
+# Stage 2: Runtime
+FROM gcr.io/distroless/static-debian12
+COPY --from=builder /app/main /
+CMD ["/main"]
+8.2 Frontend Dockerfile (Next.js Standalone)
+Sử dụng chế độ output: 'standalone' trong next.config.js. Chế độ này tự động trace các dependency cần thiết và gom chúng vào thư mục .next/standalone, loại bỏ hoàn toàn node_modules khổng lồ của môi trường dev.   
+
+Dockerfile
+#... Các bước build trước đó...
+
+# Stage: Runner
+FROM node:18-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV production
+
+# Copy các file cần thiết từ builder
+COPY --from=builder /app/public./public
+COPY --from=builder /app/.next/standalone./
+COPY --from=builder /app/.next/static./.next/static
+
+EXPOSE 3000
+CMD ["node", "server.js"]
+9. Cấu hình Môi trường Phát triển (Docker Compose)
+Để đồng bộ hóa môi trường giữa các lập trình viên, file compose.yml được sử dụng để khởi tạo toàn bộ stack, bao gồm PostgreSQL với pgvector đã được cấu hình sẵn.   
+
+YAML
+services:
+  # Cơ sở dữ liệu Postgres với extension pgvector
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: notes_db
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: notes_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  # Backend API
+  api:
+    build: 
+      context:./backend
+      dockerfile: Dockerfile
+    environment:
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db:5432/notes_db
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    depends_on:
+      - db
+    ports:
+      - "8080:8080"
+
+  # Frontend Next.js
+  web:
+    build:
+      context:./frontend
+      dockerfile: Dockerfile
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8080/query
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+Bản đặc tả này cung cấp một lộ trình rõ ràng, từ kiến trúc vĩ mô đến từng dòng code triển khai, đảm bảo đội ngũ kỹ thuật có thể xây dựng sản phẩm "AI-Enhanced Note Taker" với chất lượng cao nhất, khả năng mở rộng tốt và trải nghiệm người dùng hiện đại.
+
+
+medium.com
+Structuring your .NET Modular Monolith | by Anthony Miller | Medium
+Mở trong cửa sổ mới
+
+github.com
+Example Go monolith with embedded microservices and The Clean Architecture - GitHub
+Mở trong cửa sổ mới
+
+threedots.tech
+When using Microservices or Modular Monolith in Go can be just a detail? - Three Dots Labs
+Mở trong cửa sổ mới
+
+github.com
+kaynetik/modular-monolith-example: Accompanying Boilerplate for the article about Modular Monoliths in Go - GitHub
+Mở trong cửa sổ mới
+
+reddit.com
+Best Golang API Architecture for Monolith enterprise app? - Reddit
+Mở trong cửa sổ mới
+
+github.com
+golang gRPC template using modular monoliths - GitHub
+Mở trong cửa sổ mới
+
+docs.gofiber.io
+GraphQL - Fiber Documentation
+Mở trong cửa sổ mới
+
+docs.gofiber.io
+Go Context - Fiber Documentation
+Mở trong cửa sổ mới
+
+mobinshaterian.medium.com
+Complete Guide: Migrating from REST & gRPC to GraphQL in Go | by Mobin Shaterian
+Mở trong cửa sổ mới
+
+gqlgen.com
+Building GraphQL servers in golang - gqlgen
+Mở trong cửa sổ mới
+
+datacamp.com
+pgvector Tutorial: Integrate Vector Search into PostgreSQL - DataCamp
+Mở trong cửa sổ mới
+
+dev.to
+Part 1: Setup with PostgreSQL and pgvector - DEV Community
+Mở trong cửa sổ mới
+
+developers.googleblog.com
+Gemini Embedding now generally available in the Gemini API - Google Developers Blog
+Mở trong cửa sổ mới
+
+ai.google.dev
+Context caching | Gemini API | Google AI for Developers
+Mở trong cửa sổ mới
+
+nextjs.org
+Getting Started: Server and Client Components - Next.js
+Mở trong cửa sổ mới
+
+nextjs.org
+Getting Started: Layouts and Pages - Next.js
+Mở trong cửa sổ mới
+
+shadcn-ui-blocks.com
+Masonry Section Shadcn Blocks - 1 in the Marketing Package
+Mở trong cửa sổ mới
+
+orendra.com
+React Bits: Animated, Interactive UI Components for Modern React Apps - Orendra Singh
+Mở trong cửa sổ mới
+
+github.com
+deqode/GoArcc: Go monolith with embedded microservices including GRPC,REST,GraphQL and The Clean Architecture. - GitHub
+Mở trong cửa sổ mới
+
+docs.phidata.com
+Gemini Embedder - Phidata
+Mở trong cửa sổ mới
+
+instaclustr.com
+pgvector Hybrid Search: Benefits, Use Cases & Quick Tutorial
+Mở trong cửa sổ mới
+
+supabase.com
+Hybrid search | Supabase Docs
+Mở trong cửa sổ mới
+
+thoughtbot.com
+Recurring Events and PostgreSQL - Thoughtbot
+Mở trong cửa sổ mới
+
+dev.to
+Recurring Calendar Events — Database Design. - DEV Community
+Mở trong cửa sổ mới
+
+stackoverflow.com
+golang pass fiber context to reqular context for graphql - Stack Overflow
+Mở trong cửa sổ mới
+
+github.com
+pgvector-go/examples/loading/main.go at master - GitHub
+Mở trong cửa sổ mới
+
+ai.google.dev
+Caching | Gemini API - Google AI for Developers
+Mở trong cửa sổ mới
+
+docs.cloud.google.com
+Context caching overview | Generative AI on Vertex AI - Google Cloud Documentation
+Mở trong cửa sổ mới
+
+medium.com
+Smarter System Prompts with Context Caching in Gemini | by Lince Mathew | Medium
+Mở trong cửa sổ mới
+
+nextjs.org
+Getting Started: Project Structure | Next.js
+Mở trong cửa sổ mới
+
+ui.shadcn.com
+Building Blocks for the Web - shadcn/ui
+Mở trong cửa sổ mới
+
+reactbits.dev
+Masonry - React Bits
+Mở trong cửa sổ mới
+
+cruip.com
+How to Create a True Masonry with Next.js - Cruip
+Mở trong cửa sổ mới
+
+reactbits.dev
+Tilted Card - React Bits
+Mở trong cửa sổ mới
+
+reactbits.dev
+Grid Motion - React Bits
+Mở trong cửa sổ mới
+
+youtube.com
+Masonry Layout in React & Next.js (SSR) | Dynamic Grids - YouTube
+Mở trong cửa sổ mới
+
+reddit.com
+Using tanstack query along with zustand in an app : r/reactjs - Reddit
+Mở trong cửa sổ mới
+
+javascript.plainenglish.io
+Zustand and TanStack Query: The Dynamic Duo That Simplified My React State Management | by Blueprintblog | JavaScript in Plain English
+Mở trong cửa sổ mới
+
+tanstack.com
+Optimistic Updates | TanStack Query React Docs
+Mở trong cửa sổ mới
+
+tanstack.com
+Optimistic Updates | TanStack Query React Docs
+Mở trong cửa sổ mới
+
+docs.docker.com
+Multi-stage builds - Docker Docs
+Mở trong cửa sổ mới
+
+dev.to
+Optimizing Docker Images with Multi-Stage Builds and Distroless Approach
+Mở trong cửa sổ mới
+
+nextjs-ja-translation-docs.vercel.app
+Advanced Features: Output File Tracing | Next.js
+Mở trong cửa sổ mới
+
+hmos.dev
+Next.js with Docker, Standalone, and Custom Server - hmos.dev
+Mở trong cửa sổ mới
+
+dev.to
+Optimizing Next.js Docker Images with Standalone Mode - DEV Community
+Mở trong cửa sổ mới
+
+sarahglasmacher.com
+How to set up pgvector with Docker: Local Vector Database for Text Embeddings

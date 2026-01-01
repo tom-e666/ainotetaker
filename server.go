@@ -2,15 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Hello is a simple hello, world demonstration web server.
-//
-// It serves version information on /version and answers
-// any other request like /name by saying "Hello, name!".
-//
-// See golang.org/x/example/outyet for a more sophisticated server.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"html"
@@ -19,6 +14,8 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
+
+	"google.golang.org/genai"
 )
 
 func usage() {
@@ -44,10 +41,9 @@ func main() {
 	}
 
 	// Register handlers.
-	// All requests not otherwise mapped with go to greet.
-	// /version is mapped specifically to version.
 	http.HandleFunc("/", greet)
 	http.HandleFunc("/version", version)
+	http.HandleFunc("/gemini", gemini)
 
 	log.Printf("serving http://%s\n", *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))
@@ -72,4 +68,37 @@ func greet(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(w, "<!DOCTYPE html>\n")
 	fmt.Fprintf(w, "%s, %s!\n", *greeting, html.EscapeString(name))
+}
+
+func gemini(w http.ResponseWriter, r *http.Request) {
+	prompt := r.URL.Query().Get("prompt")
+	if prompt == "" {
+		http.Error(w, "prompt is required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.Background()
+	client, err := genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey: os.Getenv("GEMINI_API_KEY"),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	model := client.GenerativeModel("gemini-1.5-flash")
+	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "<!DOCTYPE html>\n")
+	for _, cand := range resp.Candidates {
+		for _, part := range cand.Content.Parts {
+			if txt, ok := part.(genai.Text); ok {
+				fmt.Fprintf(w, "%s", txt)
+			}
+		}
+	}
 }
